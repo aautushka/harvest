@@ -14,10 +14,10 @@ When triggered, harvest:
 
 ### Path extraction details
 
-- **Absolute paths** — any token starting with `/`. Backslash-escaped spaces are handled (`Screen\ Recording.mov` → `Screen Recording.mov`). Also tries to greedily join adjacent words for unescaped `ls`-style output.
+- **Absolute paths** — any token starting with `/`. Backslash-escaped spaces are handled (`Screen\ Recording.mov` → `Screen Recording.mov`). Paths embedded after `:` or `=` without surrounding whitespace are also found (`PREFIX=/home/user/proj`, `error:/path/to/file`). Also tries to greedily join adjacent words for unescaped `ls`-style output.
 - **Relative paths** — any token containing `/` but not starting with it (`./foo`, `src/main.rs`, `../config`).
 - **Dot-words** — bare filenames like `main.rs` or `config.yaml`. Only extracted when prompt tracking is active (see below).
-- **Trailing junk stripped** — `,`, `;`, and `:N` line-number suffixes (e.g. `file.rs:42` → `file.rs`).
+- **Trailing junk stripped** — `,`, `;`, trailing `:`, `.`, and `:N` line-number suffixes (e.g. `file.rs:42:` → `file.rs`).
 
 ### CWD tracking
 
@@ -93,11 +93,18 @@ cat /tmp/harvest_debug.txt
 ```
 
 The debug log shows:
-- `cwd` and `prompt` arguments received
-- The prompt literals extracted from the format string
-- Which lines were identified as prompt lines
-- The per-section CWD map (how `cd` tracking reconstructed past working directories)
-- Each relative path candidate and whether it resolved to an existing file
+- `cwd`, `prompt`, line count, and `--lines` limit
+- Prompt literals extracted from the format string
+- Which lines were identified as prompt lines and the per-section CWD map
+- Every absolute and relative path candidate with its `exists=true/false` result
+
+To limit scrollback depth (speeds up harvest on large histories):
+
+```bash
+harvest --lines 2000 ...
+```
+
+This processes only the last 2000 lines of stdin, so pair it with a matching `tmux capture-pane -S -2000`.
 
 Common issues:
 
@@ -106,7 +113,7 @@ Common issues:
 | Only absolute paths shown | `--prompt` not passed or no literals found in prompt pattern |
 | Relative paths missing after `cd` | `undo_cd` couldn't reconstruct — try `cd path/component` rather than `cd -` or absolute paths |
 | Dot-words (`main.rs`) not shown | Prompt tracking not active (no `--prompt` or no matching literals) |
-| Paths shown that don't exist | Shouldn't happen — existence-checked at runtime |
+| Absolute path shown as `exists=false` | File doesn't exist locally — common for paths from SSH/Docker output or cleaned build dirs |
 | `*f<Tab>` inserts single quotes | ZSH widget sourced without `${(q)selected}` — reinstall |
 
 ## How the ZSH widget inserts paths

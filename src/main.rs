@@ -32,8 +32,9 @@ fn tokenize(line: &str) -> Vec<String> {
 }
 
 fn trim_path_suffix(s: &str) -> &str {
-    // strip trailing punctuation
     let s = s.trim_end_matches(|c| matches!(c, ',' | ';'));
+    // strip trailing dots/colons first so that `file.rs:42:` → `file.rs:42` before the :N check
+    let s = s.trim_end_matches(|c| matches!(c, '.' | ':'));
     // strip :digits suffix (file:line pattern like foo.rs:42)
     if let Some(idx) = s.rfind(':') {
         let after = &s[idx + 1..];
@@ -41,17 +42,34 @@ fn trim_path_suffix(s: &str) -> &str {
             return &s[..idx];
         }
     }
-    // strip trailing dots/colons that aren't part of an extension
-    s.trim_end_matches(|c| matches!(c, '.' | ':'))
+    s
 }
 
-// Extract absolute paths (start with /)
+// Extract absolute paths (start with /).
+// Also handles paths embedded after ':' or '=' with no surrounding space,
+// e.g. "CACHE_DIR:/home/..." or "PREFIX=/home/...".
 fn extract_absolute(line: &str) -> Vec<String> {
-    tokenize(line)
-        .into_iter()
-        .filter(|t| t.starts_with('/') && t.len() > 1)
-        .map(|t| trim_path_suffix(&t).to_string())
-        .collect()
+    let mut results = Vec::new();
+    for token in tokenize(line) {
+        if token.starts_with('/') && token.len() > 1 {
+            let s = trim_path_suffix(&token).to_string();
+            if !s.is_empty() { results.push(s); }
+        } else {
+            // Look for the first ':' or '=' immediately followed by '/'
+            let bytes = token.as_bytes();
+            for i in 0..bytes.len().saturating_sub(1) {
+                if (bytes[i] == b':' || bytes[i] == b'=') && bytes[i + 1] == b'/' {
+                    let after = &token[i + 1..];
+                    if after.len() > 1 {
+                        let s = trim_path_suffix(after).to_string();
+                        if !s.is_empty() { results.push(s); }
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    results
 }
 
 // Extract relative paths (contain / but don't start with /)
@@ -330,6 +348,9 @@ mod tests {
     fn absolute_trailing_punctuation() {
         assert_eq!(extract_absolute("error at /foo/bar.rs:10"), vec!["/foo/bar.rs"]);
         assert_eq!(extract_absolute("see /foo/bar,"), vec!["/foo/bar"]);
+        // GCC/CMake style: file:line: (trailing colon)
+        assert_eq!(extract_absolute("/foo/bar.cmake:42:"), vec!["/foo/bar.cmake"]);
+        assert_eq!(extract_absolute("/foo/bar.rs:10:"), vec!["/foo/bar.rs"]);
     }
 
     #[test]
@@ -343,6 +364,18 @@ mod tests {
     #[test]
     fn absolute_ignores_bare_slash() {
         assert!(extract_absolute("cd /").is_empty());
+    }
+
+    #[test]
+    fn absolute_embedded_after_colon() {
+        assert_eq!(extract_absolute("CACHE_DIR:/foo/bar"), vec!["/foo/bar"]);
+        assert_eq!(extract_absolute("error:/foo/bar.rs"), vec!["/foo/bar.rs"]);
+    }
+
+    #[test]
+    fn absolute_embedded_after_equals() {
+        assert_eq!(extract_absolute("PREFIX=/foo/bar"), vec!["/foo/bar"]);
+        assert_eq!(extract_absolute("CMAKE_INSTALL_PREFIX=/home/user/proj"), vec!["/home/user/proj"]);
     }
 
     // --- extract_relative ---
@@ -701,30 +734,37 @@ mod tests {
 struct Args {
     cwd: PathBuf,
     prompt: Option<String>,
+    lines: Option<usize>,
     debug: bool,
 }
 
 fn parse_args() -> Args {
     let mut cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
     let mut prompt = None;
+    let mut lines = None;
     let mut debug = false;
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--cwd" => { if let Some(v) = args.next() { cwd = PathBuf::from(v); } }
-            "--prompt" => { if let Some(v) = args.next() { prompt = Some(v); } }
+            "--cwd"   => { if let Some(v) = args.next() { cwd = PathBuf::from(v); } }
+            "--prompt"=> { if let Some(v) = args.next() { prompt = Some(v); } }
+            "--lines" => { if let Some(v) = args.next() { lines = v.parse().ok(); } }
             "--debug" => { debug = true; }
             _ => {}
         }
     }
     if !debug { debug = env::var("HARVEST_DEBUG").is_ok(); }
-    Args { cwd, prompt, debug }
+    Args { cwd, prompt, lines, debug }
 }
 
 fn main() {
     let args = parse_args();
     let stdin = io::stdin();
-    let lines: Vec<String> = stdin.lock().lines().filter_map(|l| l.ok()).collect();
+    let mut lines: Vec<String> = stdin.lock().lines().filter_map(|l| l.ok()).collect();
+    if let Some(n) = args.lines {
+        let skip = lines.len().saturating_sub(n);
+        lines.drain(..skip);
+    }
 
     let debug_path = if args.debug { Some("/tmp/harvest_debug.txt") } else { None };
     macro_rules! dbg {
@@ -740,7 +780,7 @@ fn main() {
         let _ = std::fs::write(path, ""); // truncate
         dbg!("cwd: {:?}", args.cwd);
         dbg!("prompt: {:?}", args.prompt);
-        dbg!("total lines: {}", lines.len());
+        dbg!("lines: {} (--lines limit: {:?})", lines.len(), args.lines);
     }
 
     // Build prompt detection if --prompt given
@@ -797,10 +837,13 @@ fn main() {
     for (i, line) in lines.iter().enumerate().rev() {
         let cwd = cwd_for_line(i);
 
-        let abs_candidates = extract_absolute(line).into_iter()
-            .chain(extract_absolute_greedy(line));
+        let abs_candidates: Vec<String> = extract_absolute(line).into_iter()
+            .chain(extract_absolute_greedy(line))
+            .collect();
         for candidate in abs_candidates {
-            if !seen.contains(&candidate) && Path::new(&candidate).exists() {
+            let exists = Path::new(&candidate).exists();
+            dbg!("  abs [{i}] {candidate:?} → exists={exists}");
+            if !seen.contains(&candidate) && exists {
                 for v in path_variants(&candidate) {
                     if seen.insert(v.clone()) { println!("{}", v); }
                 }
