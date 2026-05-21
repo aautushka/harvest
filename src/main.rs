@@ -143,15 +143,29 @@ fn normalize_path(path: &Path) -> PathBuf {
     if components.is_empty() { PathBuf::from(".") } else { components.iter().collect() }
 }
 
-// Resolve a relative candidate against section_cwd, then re-express relative to current_cwd.
-// Falls back to absolute path if it's outside current_cwd's subtree.
+fn make_relative(from_dir: &Path, to: &Path) -> PathBuf {
+    let from: Vec<_> = from_dir.components().collect();
+    let to: Vec<_> = to.components().collect();
+    let common = from.iter().zip(to.iter()).take_while(|(a, b)| a == b).count();
+    let mut result = PathBuf::new();
+    for _ in 0..(from.len() - common) { result.push(".."); }
+    for c in &to[common..] { result.push(c); }
+    if result.as_os_str().is_empty() { result.push("."); }
+    result
+}
+
+// Resolve a relative candidate against section_cwd, re-express relative to current_cwd.
+// Returns whichever of the relative or absolute form is shorter.
 fn rebase_path(candidate: &str, section_cwd: &Path, current_cwd: &Path) -> String {
     let abs = normalize_path(&section_cwd.join(candidate));
-    match abs.strip_prefix(current_cwd) {
-        Ok(rel) if rel.as_os_str().is_empty() => ".".to_string(),
-        Ok(rel) => format!("./{}", rel.display()),
-        Err(_) => abs.to_string_lossy().into_owned(),
-    }
+    let rel = match abs.strip_prefix(current_cwd) {
+        Ok(r) if r.as_os_str().is_empty() => PathBuf::from("."),
+        Ok(r) => PathBuf::from(format!("./{}", r.display())),
+        Err(_) => make_relative(current_cwd, &abs),
+    };
+    let rel_s = rel.to_string_lossy();
+    let abs_s = abs.to_string_lossy();
+    if rel_s.len() <= abs_s.len() { rel_s.into_owned() } else { abs_s.into_owned() }
 }
 
 fn exists_at(candidate: &str, cwd: &Path) -> bool {
@@ -644,14 +658,25 @@ mod tests {
     }
 
     #[test]
-    fn rebase_outside_current_cwd_falls_back_to_absolute() {
-        // section_cwd and current_cwd are in different trees
+    fn rebase_outside_current_cwd_uses_dotdot() {
+        // ../tests/foo.rs (15) < /project/tests/foo.rs (21) → relative wins
         let result = rebase_path(
             "./foo.rs",
             Path::new("/project/tests"),
             Path::new("/project/src"),
         );
-        assert_eq!(result, "/project/tests/foo.rs");
+        assert_eq!(result, "../tests/foo.rs");
+    }
+
+    #[test]
+    fn rebase_deep_mismatch_falls_back_to_absolute() {
+        // ../../../../x/y/file.txt (24) > /x/y/file.txt (13) → absolute wins
+        let result = rebase_path(
+            "./file.txt",
+            Path::new("/x/y"),
+            Path::new("/a/b/c/d/e"),
+        );
+        assert_eq!(result, "/x/y/file.txt");
     }
 
     // --- extract_command_from_prompt_line ---
