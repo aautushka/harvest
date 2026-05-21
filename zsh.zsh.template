@@ -12,3 +12,6 @@ _harvest_pick() {
 _harvest_widget() { _harvest_pick "$LBUFFER"; }
 zle -N _harvest_widget
 bindkey '^F' _harvest_widget
+
+mkdir -p "${XDG_CACHE_HOME:-$HOME/.cache}/harvest"
+print -r -- "$PROMPT" > "${XDG_CACHE_HOME:-$HOME/.cache}/harvest/prompt"

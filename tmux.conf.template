@@ -1,3 +1,3 @@
 # harvest tmux binding. __BIN__ is substituted by install.sh with the absolute binary path.
 
-bind-key f run-shell 'selected=$(tmux capture-pane -p -t "#{pane_id}" -S -10000 | __BIN__ --cwd "#{pane_current_path}" | fzf-tmux -p --reverse) && tmux send-keys -t "#{pane_id}" "$selected" || true'
+bind-key f run-shell 'selected=$(tmux capture-pane -p -t "#{pane_id}" -S -10000 | __BIN__ --cwd "#{pane_current_path}" --prompt "$(cat "${XDG_CACHE_HOME:-$HOME/.cache}/harvest/prompt" 2>/dev/null)" | fzf-tmux -p --reverse) && tmux send-keys -t "#{pane_id}" "$selected" || true'
