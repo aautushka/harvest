@@ -31,8 +31,18 @@ fn tokenize(line: &str) -> Vec<String> {
     tokens
 }
 
-fn trim_punctuation(s: &str) -> &str {
-    s.trim_end_matches(|c| matches!(c, '.' | ',' | ':' | ';'))
+fn trim_path_suffix(s: &str) -> &str {
+    // strip trailing punctuation
+    let s = s.trim_end_matches(|c| matches!(c, ',' | ';'));
+    // strip :digits suffix (file:line pattern like foo.rs:42)
+    if let Some(idx) = s.rfind(':') {
+        let after = &s[idx + 1..];
+        if !after.is_empty() && after.chars().all(|c| c.is_ascii_digit()) {
+            return &s[..idx];
+        }
+    }
+    // strip trailing dots/colons that aren't part of an extension
+    s.trim_end_matches(|c| matches!(c, '.' | ':'))
 }
 
 // Extract absolute paths (start with /)
@@ -40,7 +50,7 @@ fn extract_absolute(line: &str) -> Vec<String> {
     tokenize(line)
         .into_iter()
         .filter(|t| t.starts_with('/') && t.len() > 1)
-        .map(|t| trim_punctuation(&t).to_string())
+        .map(|t| trim_path_suffix(&t).to_string())
         .collect()
 }
 
@@ -49,7 +59,7 @@ fn extract_relative(line: &str) -> Vec<String> {
     tokenize(line)
         .into_iter()
         .filter(|t| !t.starts_with('/') && t.contains('/'))
-        .map(|t| trim_punctuation(&t).to_string())
+        .map(|t| trim_path_suffix(&t).to_string())
         .filter(|t| !t.is_empty())
         .collect()
 }
@@ -59,7 +69,7 @@ fn extract_dotwords(line: &str) -> Vec<String> {
     tokenize(line)
         .into_iter()
         .filter(|t| !t.starts_with('/') && !t.contains('/') && t.contains('.') && !t.starts_with("http"))
-        .map(|t| trim_punctuation(&t).to_string())
+        .map(|t| trim_path_suffix(&t).to_string())
         .filter(|t| !t.is_empty())
         .collect()
 }
@@ -73,39 +83,60 @@ fn exists_at(candidate: &str, cwd: &Path) -> bool {
     }
 }
 
-// Parse a ZSH prompt string, return a stripped version usable for line matching.
-// Strips %{...%} color groups, simplifies %(?:A:B) to just A, removes other % codes.
+// Collect everything inside balanced parens (caller has already consumed the opening '(').
+fn collect_paren_content<I: Iterator<Item = char>>(chars: &mut std::iter::Peekable<I>) -> String {
+    let mut content = String::new();
+    let mut depth = 1usize;
+    for c in chars.by_ref() {
+        if c == '(' { depth += 1; }
+        if c == ')' { depth -= 1; if depth == 0 { break; } }
+        content.push(c);
+    }
+    content
+}
+
+// Split string at top-level ':' (not inside nested parens).
+fn split_top_colons(s: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0;
+    for (i, c) in s.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            ':' if depth == 0 => { parts.push(&s[start..i]); start = i + 1; }
+            _ => {}
+        }
+    }
+    parts.push(&s[start..]);
+    parts
+}
+
+// Parse a ZSH prompt string into a plain string suitable for detecting prompt lines.
+// Strips %{...%} color groups, processes %(cond:A:B) by keeping branch A, removes % codes.
 fn parse_prompt_pattern(prompt: &str) -> String {
     let mut out = String::new();
     let mut chars = prompt.chars().peekable();
     while let Some(c) = chars.next() {
-        if c != '%' {
-            out.push(c);
-            continue;
-        }
+        if c != '%' { out.push(c); continue; }
         match chars.next() {
             None => break,
             Some('{') => {
-                // %{...%} — zero-width, skip until %}
+                // %{...%} zero-width sequence — skip
                 loop {
                     match chars.next() {
-                        None | Some('%') => { chars.next(); break; } // consume }
+                        None | Some('%') => { chars.next(); break; }
                         _ => {}
                     }
                 }
             }
             Some('(') => {
-                // %(cond:true:false) — consume whole expression, emit nothing
-                // Just skip until matching )
-                let mut depth = 1;
-                while let Some(ch) = chars.next() {
-                    if ch == '(' { depth += 1; }
-                    if ch == ')' { depth -= 1; if depth == 0 { break; } }
+                // %(cond:true:false) — collect content, process first (true) branch
+                let content = collect_paren_content(&mut chars);
+                let parts = split_top_colons(&content);
+                if parts.len() >= 2 {
+                    out += &parse_prompt_pattern(parts[1]);
                 }
-            }
-            Some('?') => {
-                // %(?:A:B) ternary — skip
-                // already consumed '?', look for surrounding parens handled above
             }
             Some('1') => {
                 // %1{text%} — keep text
@@ -120,7 +151,7 @@ fn parse_prompt_pattern(prompt: &str) -> String {
                     }
                 }
             }
-            Some(_) => {} // skip other % codes (%c, %~, %n, etc.)
+            Some(_) => {} // skip %c, %~, %n, %?, etc.
         }
     }
     out.trim().to_string()
@@ -156,6 +187,236 @@ fn parse_cd(cmd: &str, current_cwd: &Path) -> Option<PathBuf> {
         if p.is_absolute() { p.to_path_buf() } else { current_cwd.join(p) }
     };
     if target.exists() { Some(target) } else { None }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- tokenize ---
+
+    #[test]
+    fn tokenize_basic() {
+        assert_eq!(tokenize("foo bar baz"), vec!["foo", "bar", "baz"]);
+    }
+
+    #[test]
+    fn tokenize_escaped_spaces() {
+        assert_eq!(
+            tokenize(r"la /Users/anton/Pictures/Screen\ Recording\ 2026.mov"),
+            vec!["la", "/Users/anton/Pictures/Screen Recording 2026.mov"]
+        );
+    }
+
+    #[test]
+    fn tokenize_strips_delimiters() {
+        assert_eq!(tokenize("foo(bar)"), vec!["foo", "bar"]);
+        assert_eq!(tokenize("\"foo\" 'bar'"), vec!["foo", "bar"]);
+    }
+
+    #[test]
+    fn tokenize_backslash_non_space() {
+        // backslash not followed by space is kept as-is
+        let tokens = tokenize(r"foo\nbar");
+        assert_eq!(tokens, vec![r"foo\nbar"]);
+    }
+
+    // --- extract_absolute ---
+
+    #[test]
+    fn absolute_basic() {
+        assert_eq!(extract_absolute("see /foo/bar and done"), vec!["/foo/bar"]);
+    }
+
+    #[test]
+    fn absolute_trailing_punctuation() {
+        assert_eq!(extract_absolute("error at /foo/bar.rs:10"), vec!["/foo/bar.rs"]);
+        assert_eq!(extract_absolute("see /foo/bar,"), vec!["/foo/bar"]);
+    }
+
+    #[test]
+    fn absolute_escaped_spaces() {
+        assert_eq!(
+            extract_absolute(r"la /Users/anton/Pictures/Screen\ Recording.mov"),
+            vec!["/Users/anton/Pictures/Screen Recording.mov"]
+        );
+    }
+
+    #[test]
+    fn absolute_ignores_bare_slash() {
+        assert!(extract_absolute("cd /").is_empty());
+    }
+
+    // --- extract_relative ---
+
+    #[test]
+    fn relative_basic() {
+        assert_eq!(extract_relative("see src/main.rs here"), vec!["src/main.rs"]);
+    }
+
+    #[test]
+    fn relative_dotslash() {
+        assert_eq!(extract_relative("run ./foo/bar"), vec!["./foo/bar"]);
+    }
+
+    #[test]
+    fn relative_parent() {
+        assert_eq!(extract_relative("edit ../config/x.yaml"), vec!["../config/x.yaml"]);
+    }
+
+    #[test]
+    fn relative_ignores_absolute() {
+        assert!(extract_relative("/foo/bar").is_empty());
+    }
+
+    #[test]
+    fn relative_trailing_punctuation() {
+        assert_eq!(extract_relative("see src/main.rs,"), vec!["src/main.rs"]);
+    }
+
+    // --- extract_dotwords ---
+
+    #[test]
+    fn dotwords_basic() {
+        assert_eq!(extract_dotwords("edit main.rs"), vec!["main.rs"]);
+        assert_eq!(extract_dotwords("config.yaml found"), vec!["config.yaml"]);
+    }
+
+    #[test]
+    fn dotwords_ignores_absolute() {
+        assert!(extract_dotwords("/foo/bar.rs").is_empty());
+    }
+
+    #[test]
+    fn dotwords_ignores_relative_paths() {
+        assert!(extract_dotwords("src/main.rs").is_empty());
+    }
+
+    #[test]
+    fn dotwords_ignores_urls() {
+        assert!(extract_dotwords("https://example.com").is_empty());
+        assert!(extract_dotwords("http://foo.bar").is_empty());
+    }
+
+    #[test]
+    fn dotwords_trailing_punctuation() {
+        assert_eq!(extract_dotwords("see main.rs."), vec!["main.rs"]);
+    }
+
+    // --- parse_prompt_pattern ---
+
+    #[test]
+    fn prompt_pattern_user_prompt() {
+        // The actual prompt from this project
+        let prompt = r"%(?:%{%}%1{➜%} :%{%}%1{➜%} ) %{%}%c%{%} $(git_prompt_info)";
+        let pattern = parse_prompt_pattern(prompt);
+        // Should contain ➜ (from %1{➜%}) and strip color/conditional cruft
+        assert!(pattern.contains('➜'), "pattern: {:?}", pattern);
+        assert!(!pattern.contains("%{"), "pattern: {:?}", pattern);
+        assert!(!pattern.contains("%c"), "pattern: {:?}", pattern);
+        assert!(!pattern.contains("%("), "pattern: {:?}", pattern);
+    }
+
+    #[test]
+    fn prompt_pattern_strips_color_groups() {
+        let pattern = parse_prompt_pattern("%{\\e[32m%}hello%{\\e[0m%}");
+        assert_eq!(pattern, "hello");
+    }
+
+    #[test]
+    fn prompt_pattern_keeps_n_braces() {
+        // %1{text%} should keep "text"
+        let pattern = parse_prompt_pattern("%1{➜%}");
+        assert_eq!(pattern, "➜");
+    }
+
+    #[test]
+    fn prompt_pattern_strips_conditionals() {
+        // first branch (true) is kept, false branch and condition are dropped
+        let pattern = parse_prompt_pattern("%(?:yes:no) rest");
+        assert_eq!(pattern, "yes rest");
+    }
+
+    #[test]
+    fn prompt_pattern_strips_percent_codes() {
+        // %c, %~, %n etc. should be stripped
+        let pattern = parse_prompt_pattern("user %n at %m in %~");
+        assert_eq!(pattern, "user  at  in");
+    }
+
+    // --- is_prompt_line ---
+
+    #[test]
+    fn prompt_line_detection() {
+        let literals = vec!["➜"];
+        assert!(is_prompt_line("➜  harvest git:(main)", &literals));
+        assert!(!is_prompt_line("some random output", &literals));
+    }
+
+    #[test]
+    fn prompt_line_multiple_literals() {
+        let literals = vec!["➜", "git:("];
+        assert!(is_prompt_line("➜  harvest git:(main) ✗", &literals));
+        assert!(!is_prompt_line("➜  harvest", &literals)); // missing git:(
+    }
+
+    #[test]
+    fn prompt_line_empty_literals() {
+        assert!(!is_prompt_line("anything", &[]));
+    }
+
+    // --- parse_cd ---
+
+    #[test]
+    fn parse_cd_absolute() {
+        let cwd = PathBuf::from("/tmp");
+        let result = parse_cd("cd /tmp", &cwd);
+        assert_eq!(result, Some(PathBuf::from("/tmp")));
+    }
+
+    #[test]
+    fn parse_cd_relative() {
+        let result = parse_cd("cd harvest", &PathBuf::from("/Users/anton/proj"));
+        // /Users/anton/proj/harvest exists in this repo's context — just check logic
+        let expected = PathBuf::from("/Users/anton/proj/harvest");
+        assert_eq!(result, if expected.exists() { Some(expected) } else { None });
+    }
+
+    #[test]
+    fn parse_cd_tilde() {
+        let result = parse_cd("cd ~", &PathBuf::from("/tmp"));
+        let home = std::env::var("HOME").unwrap_or_default();
+        assert_eq!(result, Some(PathBuf::from(&home)));
+    }
+
+    #[test]
+    fn parse_cd_tilde_subdir() {
+        let result = parse_cd("cd ~/proj", &PathBuf::from("/tmp"));
+        let home = std::env::var("HOME").unwrap_or_default();
+        let expected = PathBuf::from(format!("{}/proj", home));
+        assert_eq!(result, if expected.exists() { Some(expected) } else { None });
+    }
+
+    #[test]
+    fn parse_cd_dash_returns_none() {
+        assert_eq!(parse_cd("cd -", &PathBuf::from("/tmp")), None);
+    }
+
+    #[test]
+    fn parse_cd_no_cd_returns_none() {
+        assert_eq!(parse_cd("ls -la", &PathBuf::from("/tmp")), None);
+    }
+
+    #[test]
+    fn parse_cd_nonexistent_returns_none() {
+        assert_eq!(parse_cd("cd /this/does/not/exist/ever", &PathBuf::from("/tmp")), None);
+    }
+
+    #[test]
+    fn parse_cd_quoted() {
+        let result = parse_cd("cd \"/tmp\"", &PathBuf::from("/"));
+        assert_eq!(result, Some(PathBuf::from("/tmp")));
+    }
 }
 
 struct Args {
