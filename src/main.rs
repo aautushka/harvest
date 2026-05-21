@@ -53,7 +53,8 @@ fn extract_absolute(line: &str) -> Vec<String> {
     for token in tokenize(line) {
         if token.starts_with('/') && token.len() > 1 {
             let s = trim_path_suffix(&token).to_string();
-            if !s.is_empty() { results.push(s); }
+            // Re-check len after trimming: e.g. "/.."->"/" should be dropped
+            if s.len() > 1 { results.push(s); }
         } else {
             // Look for the first ':' or '=' immediately followed by '/'
             let bytes = token.as_bytes();
@@ -62,7 +63,7 @@ fn extract_absolute(line: &str) -> Vec<String> {
                     let after = &token[i + 1..];
                     if after.len() > 1 {
                         let s = trim_path_suffix(after).to_string();
-                        if !s.is_empty() { results.push(s); }
+                        if s.len() > 1 { results.push(s); }
                     }
                     break;
                 }
@@ -107,7 +108,7 @@ fn extract_absolute_greedy(line: &str) -> Vec<String> {
         let word = words[i];
         if !word.starts_with('/') || word.len() <= 1 { continue; }
         let trimmed = trim_path_suffix(word).to_string();
-        if !trimmed.is_empty() && Path::new(&trimmed).exists() {
+        if trimmed.len() > 1 && Path::new(&trimmed).exists() {
             results.push(trimmed);
             continue;
         }
@@ -116,7 +117,7 @@ fn extract_absolute_greedy(line: &str) -> Vec<String> {
             candidate.push(' ');
             candidate.push_str(words[j]);
             let trimmed = trim_path_suffix(&candidate).to_string();
-            if !trimmed.is_empty() && Path::new(&trimmed).exists() {
+            if trimmed.len() > 1 && Path::new(&trimmed).exists() {
                 results.push(trimmed);
                 skip_until = j + 1;
                 break;
@@ -406,6 +407,12 @@ mod tests {
     #[test]
     fn absolute_ignores_bare_slash() {
         assert!(extract_absolute("cd /").is_empty());
+    }
+
+    #[test]
+    fn absolute_ignores_slash_from_dotdot() {
+        // "cd $(pwd)/.." tokenizes to ["cd","$","pwd","/.." ] — "/.."->"/" must be dropped
+        assert!(extract_absolute("cd $(pwd)/..").iter().all(|p| p != "/"));
     }
 
     #[test]
@@ -835,6 +842,7 @@ mod tests {
 struct Args {
     cwd: PathBuf,
     prompt: Option<String>,
+    cwd_log: Option<PathBuf>,
     lines: Option<usize>,
     debug: bool,
 }
@@ -842,20 +850,22 @@ struct Args {
 fn parse_args() -> Args {
     let mut cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
     let mut prompt = None;
+    let mut cwd_log = None;
     let mut lines = None;
     let mut debug = false;
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--cwd"   => { if let Some(v) = args.next() { cwd = PathBuf::from(v); } }
-            "--prompt"=> { if let Some(v) = args.next() { prompt = Some(v); } }
-            "--lines" => { if let Some(v) = args.next() { lines = v.parse().ok(); } }
-            "--debug" => { debug = true; }
+            "--cwd"     => { if let Some(v) = args.next() { cwd = PathBuf::from(v); } }
+            "--prompt"  => { if let Some(v) = args.next() { prompt = Some(v); } }
+            "--cwd-log" => { if let Some(v) = args.next() { cwd_log = Some(PathBuf::from(v)); } }
+            "--lines"   => { if let Some(v) = args.next() { lines = v.parse().ok(); } }
+            "--debug"   => { debug = true; }
             _ => {}
         }
     }
     if !debug { debug = env::var("HARVEST_DEBUG").is_ok(); }
-    Args { cwd, prompt, lines, debug }
+    Args { cwd, prompt, cwd_log, lines, debug }
 }
 
 fn main() {
@@ -901,7 +911,6 @@ fn main() {
     let mut section_cwds: Vec<(usize, PathBuf)> = Vec::new();
 
     if use_prompt {
-        let mut cwd = args.cwd.clone();
         let prompt_indices: Vec<usize> = lines.iter().enumerate()
             .filter(|(_, l)| is_prompt_line(l, &prompt_literals))
             .map(|(i, _)| i)
@@ -909,17 +918,56 @@ fn main() {
 
         dbg!("prompt line indices: {prompt_indices:?}");
 
-        for &i in prompt_indices.iter().rev().take(20) {
-            dbg!("  prompt[{i}]: {:?}", lines[i]);
-            let prev_cwd = if let Some(target) = find_cd_in_line(&lines[i]) {
-                dbg!("    cd target: {target:?}, undo from {cwd:?}");
-                undo_cd(target, &cwd).unwrap_or_else(|| cwd.clone())
-            } else {
-                cwd.clone()
-            };
-            dbg!("    section cwd: {prev_cwd:?}");
-            section_cwds.push((i, prev_cwd.clone()));
-            cwd = prev_cwd;
+        // Parse cwd log if available (format: "CWD\tCOMMAND" per line).
+        let log_entries: Option<Vec<(PathBuf, String)>> = args.cwd_log.as_ref()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .map(|s| s.lines().filter_map(|line| {
+                let (cwd, cmd) = line.split_once('\t')?;
+                Some((PathBuf::from(cwd), cmd.to_string()))
+            }).collect());
+
+        if let Some(ref e) = log_entries { dbg!("cwd_log: {} entries", e.len()); }
+
+        // Step 1: undo_cd baseline — works for all prompts, but breaks on absolute cd.
+        let mut undo_baseline: Vec<(usize, PathBuf)> = Vec::new();
+        {
+            let mut cwd = args.cwd.clone();
+            for &i in prompt_indices.iter().rev().take(20) {
+                let prev_cwd = if let Some(target) = find_cd_in_line(&lines[i]) {
+                    dbg!("  undo_cd prompt[{i}]: cd {target:?} from {cwd:?}");
+                    undo_cd(target, &cwd).unwrap_or_else(|| cwd.clone())
+                } else {
+                    cwd.clone()
+                };
+                undo_baseline.push((i, prev_cwd.clone()));
+                cwd = prev_cwd;
+            }
+        }
+
+        // Step 2: for each prompt, prefer a cwd_log match; fall back to undo_cd baseline.
+        // Scan log from bottom so most-recent log entry matches most-recent prompt line.
+        let mut log_ptr = log_entries.as_ref().map(|e| e.len()).unwrap_or(0);
+        for (prompt_idx, undo_cwd) in undo_baseline {
+            let prompt_line = &lines[prompt_idx];
+            let mut matched_cwd = None;
+            if let Some(ref entries) = log_entries {
+                let mut scan = log_ptr;
+                while scan > 0 {
+                    scan -= 1;
+                    let (cwd, cmd) = &entries[scan];
+                    if !cmd.is_empty() && prompt_line.ends_with(cmd.as_str()) {
+                        let before = prompt_line.len() - cmd.len();
+                        if before == 0 || prompt_line.as_bytes()[before - 1] == b' ' {
+                            matched_cwd = Some(cwd.clone());
+                            log_ptr = scan;
+                            break;
+                        }
+                    }
+                }
+            }
+            let cwd = matched_cwd.unwrap_or(undo_cwd);
+            dbg!("  prompt[{prompt_idx}] {:?} → {cwd:?}", prompt_line);
+            section_cwds.push((prompt_idx, cwd));
         }
     }
 

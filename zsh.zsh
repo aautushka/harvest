@@ -1,10 +1,23 @@
 # harvest ZSH widget — insert scrollback paths at cursor via Ctrl-F
 [[ -z "${TMUX:-}" ]] && return
 
+mkdir -p "${XDG_CACHE_HOME:-$HOME/.cache}/harvest"
+
+# Per-pane CWD log: one line per command executed, format: CWD\tCOMMAND
+# Exported so interactive ZSH subshells inherit the flag and don't truncate.
+_harvest_cwd_log="${XDG_CACHE_HOME:-$HOME/.cache}/harvest/cwd_${TMUX_PANE}"
+if [[ -z "${_harvest_session_started:-}" ]]; then
+  export _harvest_session_started=1
+  : > "$_harvest_cwd_log"
+fi
+
+_harvest_record_cmd() { printf '%s\t%s\n' "$PWD" "$1" >> "$_harvest_cwd_log" }
+preexec_functions=(${preexec_functions:#_harvest_record_cmd} _harvest_record_cmd)
+
 _harvest_pick() {
   setopt localoptions noglobsubst noposixbuiltins pipefail no_aliases 2>/dev/null
   local selected
-  selected=$(tmux capture-pane -p -t "$TMUX_PANE" -S -10000 | /Users/anton/proj/harvest/target/release/harvest --cwd "$PWD" --prompt "$PROMPT" | fzf --reverse --height 40%)
+  selected=$(tmux capture-pane -p -t "$TMUX_PANE" -S -10000 | /Users/anton/proj/harvest/target/release/harvest --cwd "$PWD" --prompt "$PROMPT" --cwd-log "$_harvest_cwd_log" | fzf --reverse --height 40%)
   [[ -n "$selected" ]] && LBUFFER="${1}${(q)selected}"
   zle reset-prompt
 }
@@ -13,5 +26,4 @@ _harvest_widget() { _harvest_pick "$LBUFFER"; }
 zle -N _harvest_widget
 bindkey '^F' _harvest_widget
 
-mkdir -p "${XDG_CACHE_HOME:-$HOME/.cache}/harvest"
 print -r -- "$PROMPT" > "${XDG_CACHE_HOME:-$HOME/.cache}/harvest/prompt"
