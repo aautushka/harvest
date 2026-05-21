@@ -126,6 +126,34 @@ fn extract_absolute_greedy(line: &str) -> Vec<String> {
     results
 }
 
+fn normalize_path(path: &Path) -> PathBuf {
+    let mut components: Vec<std::path::Component> = Vec::new();
+    for c in path.components() {
+        match c {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => match components.last() {
+                Some(std::path::Component::RootDir)
+                | Some(std::path::Component::Prefix(_))
+                | None => components.push(c),
+                _ => { components.pop(); }
+            },
+            c => components.push(c),
+        }
+    }
+    if components.is_empty() { PathBuf::from(".") } else { components.iter().collect() }
+}
+
+// Resolve a relative candidate against section_cwd, then re-express relative to current_cwd.
+// Falls back to absolute path if it's outside current_cwd's subtree.
+fn rebase_path(candidate: &str, section_cwd: &Path, current_cwd: &Path) -> String {
+    let abs = normalize_path(&section_cwd.join(candidate));
+    match abs.strip_prefix(current_cwd) {
+        Ok(rel) if rel.as_os_str().is_empty() => ".".to_string(),
+        Ok(rel) => format!("./{}", rel.display()),
+        Err(_) => abs.to_string_lossy().into_owned(),
+    }
+}
+
 fn exists_at(candidate: &str, cwd: &Path) -> bool {
     let p = Path::new(candidate);
     if p.is_absolute() {
@@ -578,6 +606,54 @@ mod tests {
         assert!(results.is_empty());
     }
 
+    // --- normalize_path ---
+
+    #[test]
+    fn normalize_removes_curdir() {
+        assert_eq!(normalize_path(Path::new("/a/b/./c")), PathBuf::from("/a/b/c"));
+    }
+
+    #[test]
+    fn normalize_removes_parentdir() {
+        assert_eq!(normalize_path(Path::new("/a/b/../c")), PathBuf::from("/a/c"));
+    }
+
+    // --- rebase_path ---
+
+    #[test]
+    fn rebase_subdir_candidate() {
+        // find ran in /harvest, we're now in /harvest/src
+        // ./src/main.rs from /harvest → ./main.rs from /harvest/src
+        let result = rebase_path(
+            "./src/main.rs",
+            Path::new("/harvest"),
+            Path::new("/harvest/src"),
+        );
+        assert_eq!(result, "./main.rs");
+    }
+
+    #[test]
+    fn rebase_same_cwd() {
+        // no cd; candidate is valid as-is
+        let result = rebase_path(
+            "./src/main.rs",
+            Path::new("/harvest"),
+            Path::new("/harvest"),
+        );
+        assert_eq!(result, "./src/main.rs");
+    }
+
+    #[test]
+    fn rebase_outside_current_cwd_falls_back_to_absolute() {
+        // section_cwd and current_cwd are in different trees
+        let result = rebase_path(
+            "./foo.rs",
+            Path::new("/project/tests"),
+            Path::new("/project/src"),
+        );
+        assert_eq!(result, "/project/tests/foo.rs");
+    }
+
     // --- extract_command_from_prompt_line ---
 
     #[test]
@@ -852,18 +928,16 @@ fn main() {
 
         for candidate in extract_relative(line) {
             dbg!("  rel [{i}] {candidate:?} in {cwd:?} → exists={}", exists_at(&candidate, cwd));
-            if !seen.contains(&candidate) && exists_at(&candidate, cwd) {
-                for v in path_variants(&candidate) {
-                    if seen.insert(v.clone()) { println!("{}", v); }
-                }
-            }
+            if !exists_at(&candidate, cwd) { continue; }
+            let output = rebase_path(&candidate, cwd, &args.cwd);
+            if seen.insert(output.clone()) { println!("{}", output); }
         }
 
         if use_prompt {
             for candidate in extract_dotwords(line) {
-                if seen.insert(candidate.clone()) && exists_at(&candidate, cwd) {
-                    println!("{}", candidate);
-                }
+                if !exists_at(&candidate, cwd) { continue; }
+                let output = rebase_path(&candidate, cwd, &args.cwd);
+                if seen.insert(output.clone()) { println!("{}", output); }
             }
         }
     }
