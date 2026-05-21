@@ -5,7 +5,7 @@ _harvest_pick() {
   setopt localoptions noglobsubst noposixbuiltins pipefail no_aliases 2>/dev/null
   local selected
   selected=$(tmux capture-pane -p -t "$TMUX_PANE" -S -10000 | __BIN__ --cwd "$PWD" --prompt "$PROMPT" | fzf --reverse --height 40%)
-  [[ -n "$selected" ]] && LBUFFER="${1}${selected}"
+  [[ -n "$selected" ]] && LBUFFER="${1}${(q)selected}"
   zle reset-prompt
 }
 
