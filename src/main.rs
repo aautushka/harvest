@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::env;
-use std::io::{self, BufRead};
+use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 
 // Tokenize a line respecting backslash-escaped spaces (e.g. foo\ bar -> "foo bar")
@@ -152,6 +152,16 @@ fn parse_prompt_pattern(prompt: &str) -> String {
     let mut out = String::new();
     let mut chars = prompt.chars().peekable();
     while let Some(c) = chars.next() {
+        // Strip $(...) shell command substitutions — their output is dynamic
+        if c == '$' && chars.peek() == Some(&'(') {
+            chars.next();
+            let mut depth = 1usize;
+            for ch in chars.by_ref() {
+                if ch == '(' { depth += 1; }
+                if ch == ')' { depth -= 1; if depth == 0 { break; } }
+            }
+            continue;
+        }
         if c != '%' { out.push(c); continue; }
         match chars.next() {
             None => break,
@@ -192,12 +202,39 @@ fn parse_prompt_pattern(prompt: &str) -> String {
 }
 
 // Detect if a line looks like a prompt line using the stripped prompt pattern.
-// We look for the fixed literal parts of the prompt in the line.
 fn is_prompt_line(line: &str, prompt_literals: &[&str]) -> bool {
     if prompt_literals.is_empty() {
         return false;
     }
     prompt_literals.iter().all(|lit| line.contains(lit))
+}
+
+// Extract the command from a prompt line by taking everything after the last prompt literal.
+fn extract_command_from_prompt_line<'a>(line: &'a str, prompt_literals: &[&str]) -> &'a str {
+    let last_end = prompt_literals.iter()
+        .filter_map(|lit| line.rfind(lit).map(|pos| pos + lit.len()))
+        .max()
+        .unwrap_or(0);
+    line[last_end..].trim()
+}
+
+// Find a `cd <target>` in a prompt line without needing to know where the prompt ends.
+// Searches for the pattern ` cd <word>` from the right.
+fn find_cd_in_line(line: &str) -> Option<&str> {
+    // Look for " cd " followed by a target (last occurrence wins)
+    let mut search = line;
+    while let Some(pos) = search.rfind(" cd ") {
+        let rest = search[pos + 4..].trim();
+        if !rest.is_empty() {
+            // Take first word (stop at space, pipe, semicolon)
+            let target = rest.split(|c: char| c.is_whitespace() || c == '|' || c == ';').next()?;
+            if !target.is_empty() {
+                return Some(target);
+            }
+        }
+        search = &search[..pos];
+    }
+    None
 }
 
 // Try to extract a `cd` target from a command line (after the prompt).
@@ -215,12 +252,39 @@ fn parse_cd(cmd: &str, current_cwd: &Path) -> Option<PathBuf> {
     } else if target == "~" {
         PathBuf::from(env::var("HOME").unwrap_or_default())
     } else if target == "-" {
-        return None; // can't track cd -
+        return None;
     } else {
         let p = Path::new(target);
         if p.is_absolute() { p.to_path_buf() } else { current_cwd.join(p) }
     };
     if target.exists() { Some(target) } else { None }
+}
+
+// Reverse of parse_cd: given the cd target string and the resulting cwd,
+// reconstruct the cwd before the cd. Only works for simple relative subdirs.
+fn undo_cd(target: &str, result_cwd: &Path) -> Option<PathBuf> {
+    let target = target.trim().trim_matches('"').trim_matches('\'');
+    if target.is_empty() || target == "-" || target == "~"
+        || target.starts_with("~/") || Path::new(target).is_absolute()
+    {
+        return None;
+    }
+    let target_path = Path::new(target);
+    if target_path.components().any(|c| c == std::path::Component::ParentDir) {
+        return None; // has .., too complex
+    }
+    let tc: Vec<_> = target_path.components().collect();
+    let rc: Vec<_> = result_cwd.components().collect();
+    if rc.len() <= tc.len() { return None; }
+    let split = rc.len() - tc.len();
+    let matches = rc[split..].iter().map(|c| c.as_os_str())
+        .eq(tc.iter().map(|c| c.as_os_str()));
+    if matches {
+        let prev: PathBuf = rc[..split].iter().collect();
+        if !prev.as_os_str().is_empty() { Some(prev) } else { None }
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -338,6 +402,15 @@ mod tests {
     }
 
     // --- parse_prompt_pattern ---
+
+    #[test]
+    fn prompt_pattern_strips_command_substitution() {
+        let prompt = r"%(?:%{%}%1{➜%} :%{%}%1{➜%} ) %{%}%c%{%} $(git_prompt_info)";
+        let pattern = parse_prompt_pattern(prompt);
+        assert!(!pattern.contains("$("), "pattern: {:?}", pattern);
+        assert!(!pattern.contains("git_prompt_info"), "pattern: {:?}", pattern);
+        assert!(pattern.contains('➜'), "pattern: {:?}", pattern);
+    }
 
     #[test]
     fn prompt_pattern_user_prompt() {
@@ -472,6 +545,105 @@ mod tests {
         assert!(results.is_empty());
     }
 
+    // --- extract_command_from_prompt_line ---
+
+    #[test]
+    fn command_extracted_from_prompt_line() {
+        let literals = vec!["➜", "git:(main)"];
+        assert_eq!(
+            extract_command_from_prompt_line("➜  harvest git:(main) cd src", &literals),
+            "cd src"
+        );
+    }
+
+    #[test]
+    fn command_extracted_non_cd() {
+        let literals = vec!["➜", "git:(main)"];
+        assert_eq!(
+            extract_command_from_prompt_line("➜  harvest git:(main) find . | grep foo", &literals),
+            "find . | grep foo"
+        );
+    }
+
+    #[test]
+    fn command_empty_prompt_line() {
+        let literals = vec!["➜", "git:(main)"];
+        // prompt with no command (user just pressed enter or trigger key)
+        assert_eq!(
+            extract_command_from_prompt_line("➜  src git:(main) ✗", &literals),
+            "✗"  // ✗ is not in literals here, so it's treated as trailing text
+        );
+    }
+
+    #[test]
+    fn command_with_dirty_marker_in_literals() {
+        let literals = vec!["➜", "git:(main)", "✗"];
+        assert_eq!(
+            extract_command_from_prompt_line("➜  harvest git:(main) ✗ cd src", &literals),
+            "cd src"
+        );
+    }
+
+    // --- find_cd_in_line ---
+
+    #[test]
+    fn find_cd_extracts_from_prompt_line() {
+        assert_eq!(find_cd_in_line("➜  harvest git:(main) cd src"), Some("src"));
+    }
+
+    #[test]
+    fn find_cd_extracts_absolute() {
+        assert_eq!(find_cd_in_line("➜  harvest git:(main) cd /tmp"), Some("/tmp"));
+    }
+
+    #[test]
+    fn find_cd_returns_none_for_non_cd() {
+        assert_eq!(find_cd_in_line("➜  harvest git:(main) find . | grep main"), None);
+    }
+
+    #[test]
+    fn find_cd_ignores_cd_in_path() {
+        // "cat /tmp/cd files.txt" - cd is part of a path, not a command
+        // But since this would also be a prompt line check first, low risk
+        assert_eq!(find_cd_in_line("cat /tmp/nocd here"), None);
+    }
+
+    // --- undo_cd ---
+
+    #[test]
+    fn undo_cd_simple_subdir() {
+        let result = undo_cd("src", Path::new("/Users/anton/proj/harvest/src"));
+        assert_eq!(result, Some(PathBuf::from("/Users/anton/proj/harvest")));
+    }
+
+    #[test]
+    fn undo_cd_multi_component() {
+        let result = undo_cd("proj/harvest", Path::new("/Users/anton/proj/harvest"));
+        assert_eq!(result, Some(PathBuf::from("/Users/anton")));
+    }
+
+    #[test]
+    fn undo_cd_mismatch_returns_none() {
+        // last component doesn't match target
+        let result = undo_cd("other", Path::new("/Users/anton/proj/harvest/src"));
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn undo_cd_absolute_returns_none() {
+        assert_eq!(undo_cd("/tmp", Path::new("/tmp")), None);
+    }
+
+    #[test]
+    fn undo_cd_parent_returns_none() {
+        assert_eq!(undo_cd("..", Path::new("/Users/anton")), None);
+    }
+
+    #[test]
+    fn undo_cd_dash_returns_none() {
+        assert_eq!(undo_cd("-", Path::new("/tmp")), None);
+    }
+
     // --- parse_cd ---
 
     #[test]
@@ -529,26 +701,47 @@ mod tests {
 struct Args {
     cwd: PathBuf,
     prompt: Option<String>,
+    debug: bool,
 }
 
 fn parse_args() -> Args {
     let mut cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
     let mut prompt = None;
+    let mut debug = false;
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--cwd" => { if let Some(v) = args.next() { cwd = PathBuf::from(v); } }
             "--prompt" => { if let Some(v) = args.next() { prompt = Some(v); } }
+            "--debug" => { debug = true; }
             _ => {}
         }
     }
-    Args { cwd, prompt }
+    if !debug { debug = env::var("HARVEST_DEBUG").is_ok(); }
+    Args { cwd, prompt, debug }
 }
 
 fn main() {
     let args = parse_args();
     let stdin = io::stdin();
     let lines: Vec<String> = stdin.lock().lines().filter_map(|l| l.ok()).collect();
+
+    let debug_path = if args.debug { Some("/tmp/harvest_debug.txt") } else { None };
+    macro_rules! dbg {
+        ($($arg:tt)*) => {
+            if let Some(path) = debug_path {
+                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                    let _ = writeln!(f, $($arg)*);
+                }
+            }
+        }
+    }
+    if let Some(path) = debug_path {
+        let _ = std::fs::write(path, ""); // truncate
+        dbg!("cwd: {:?}", args.cwd);
+        dbg!("prompt: {:?}", args.prompt);
+        dbg!("total lines: {}", lines.len());
+    }
 
     // Build prompt detection if --prompt given
     let prompt_literals_storage: Vec<String> = args.prompt.as_deref()
@@ -561,36 +754,32 @@ fn main() {
     let prompt_literals: Vec<&str> = prompt_literals_storage.iter().map(|s| s.as_str()).collect();
     let use_prompt = args.prompt.is_some() && !prompt_literals.is_empty();
 
+    dbg!("use_prompt: {use_prompt}, literals: {prompt_literals:?}");
+
     // Build per-section CWD map for last 20 commands (when prompt available).
-    // sections[i] = (line_index_start, cwd)  — line ranges from bottom, most recent first
-    let mut section_cwds: Vec<(usize, PathBuf)> = Vec::new(); // (line_idx, cwd at that point)
+    let mut section_cwds: Vec<(usize, PathBuf)> = Vec::new();
 
     if use_prompt {
-        // Walk lines top-to-bottom tracking CWD; keep only last 20 prompt sections
         let mut cwd = args.cwd.clone();
-        let mut sections_fwd: Vec<(usize, PathBuf)> = Vec::new();
+        let prompt_indices: Vec<usize> = lines.iter().enumerate()
+            .filter(|(_, l)| is_prompt_line(l, &prompt_literals))
+            .map(|(i, _)| i)
+            .collect();
 
-        for (i, line) in lines.iter().enumerate() {
-            if is_prompt_line(line, &prompt_literals) {
-                // Next non-empty line after prompt is the command
-                if let Some(cmd_line) = lines[i+1..].iter().find(|l| !l.trim().is_empty()) {
-                    let cmd = if use_prompt {
-                        // strip prompt prefix heuristically: drop first token-like chunk
-                        cmd_line.trim()
-                    } else {
-                        cmd_line.trim()
-                    };
-                    if let Some(new_cwd) = parse_cd(cmd, &cwd) {
-                        cwd = new_cwd;
-                    }
-                }
-                sections_fwd.push((i, cwd.clone()));
-            }
+        dbg!("prompt line indices: {prompt_indices:?}");
+
+        for &i in prompt_indices.iter().rev().take(20) {
+            dbg!("  prompt[{i}]: {:?}", lines[i]);
+            let prev_cwd = if let Some(target) = find_cd_in_line(&lines[i]) {
+                dbg!("    cd target: {target:?}, undo from {cwd:?}");
+                undo_cd(target, &cwd).unwrap_or_else(|| cwd.clone())
+            } else {
+                cwd.clone()
+            };
+            dbg!("    section cwd: {prev_cwd:?}");
+            section_cwds.push((i, prev_cwd.clone()));
+            cwd = prev_cwd;
         }
-
-        // Keep last 20, reverse so index 0 = most recent
-        let start = sections_fwd.len().saturating_sub(20);
-        section_cwds = sections_fwd[start..].iter().rev().cloned().collect();
     }
 
     // For a given line index, find the best CWD to use
@@ -605,11 +794,9 @@ fn main() {
 
     let mut seen: HashSet<String> = HashSet::new();
 
-    // Iterate bottom-to-top (most recent first)
     for (i, line) in lines.iter().enumerate().rev() {
         let cwd = cwd_for_line(i);
 
-        // Absolute paths (escape-aware tokenizer + greedy space-joiner for ls output)
         let abs_candidates = extract_absolute(line).into_iter()
             .chain(extract_absolute_greedy(line));
         for candidate in abs_candidates {
@@ -620,8 +807,8 @@ fn main() {
             }
         }
 
-        // Relative paths (contain /)
         for candidate in extract_relative(line) {
+            dbg!("  rel [{i}] {candidate:?} in {cwd:?} → exists={}", exists_at(&candidate, cwd));
             if !seen.contains(&candidate) && exists_at(&candidate, cwd) {
                 for v in path_variants(&candidate) {
                     if seen.insert(v.clone()) { println!("{}", v); }
@@ -629,7 +816,6 @@ fn main() {
             }
         }
 
-        // Dot-words (foo.rs) — only when prompt tracking is active
         if use_prompt {
             for candidate in extract_dotwords(line) {
                 if seen.insert(candidate.clone()) && exists_at(&candidate, cwd) {
