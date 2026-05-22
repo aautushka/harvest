@@ -348,6 +348,96 @@ fn undo_cd(target: &str, result_cwd: &Path) -> Option<PathBuf> {
     }
 }
 
+/// Resolve a `$VAR` or `${VAR}` token from the process environment.
+fn resolve_env_token(token: &str) -> Option<String> {
+    let name = token.strip_prefix('$')?;
+    let name = if let Some(inner) = name.strip_prefix('{') {
+        inner.trim_end_matches('}')
+    } else {
+        name
+    };
+    if name.is_empty() { return None; }
+    env::var(name).ok()
+}
+
+/// Extract directory candidates from a command string.
+/// Returns absolute, normalised PathBufs that are existing directories.
+/// Handles: absolute paths, relative paths (`.`, `..`, `a/b`), `~`, `~/sub`,
+/// `$VAR` / `${VAR}`, and embedded `KEY=/path` / `KEY=$VAR` assignments.
+fn extract_dir_candidates(cmd: &str, base_cwd: &Path) -> Vec<PathBuf> {
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+    let mut out: Vec<PathBuf> = Vec::new();
+
+    let mut push = |raw: PathBuf| {
+        let p = normalize_path(&raw);
+        if p.is_dir() && seen.insert(p.clone()) {
+            out.push(p);
+        }
+    };
+
+    for token in tokenize(cmd) {
+        // Resolve the token itself as a path candidate.
+        if token.starts_with('$') {
+            // Handle both `$VAR` and `$VAR/rest` (e.g. `$HOME/proj`, `$HOME/..`)
+            let (var_tok, suffix) = match token.find('/') {
+                Some(i) => (&token[..i], &token[i..]),
+                None    => (token.as_str(), ""),
+            };
+            if let Some(val) = resolve_env_token(var_tok) {
+                let full = format!("{val}{suffix}");
+                let p = PathBuf::from(full);
+                push(if p.is_absolute() { p } else { base_cwd.join(p) });
+            }
+        } else if token == "~" {
+            if let Ok(home) = env::var("HOME") { push(PathBuf::from(home)); }
+        } else if let Some(rest) = token.strip_prefix("~/") {
+            if let Ok(home) = env::var("HOME") { push(PathBuf::from(format!("{home}/{rest}"))); }
+        } else if token.starts_with('/') {
+            push(PathBuf::from(&token));
+        } else if token.contains('/') || token == ".." || token == "." {
+            push(base_cwd.join(&token));
+        }
+
+        // Also check for embedded `KEY=/path` or `KEY=$VAR` assignments.
+        if let Some(eq) = token.find('=') {
+            let after = &token[eq + 1..];
+            if after.starts_with('/') {
+                push(PathBuf::from(after));
+            } else if after.starts_with('$') {
+                // Handle both `$VAR` and `$VAR/rest`
+                let (var_tok, suffix) = match after.find('/') {
+                    Some(i) => (&after[..i], &after[i..]),
+                    None    => (after, ""),
+                };
+                if let Some(val) = resolve_env_token(var_tok) {
+                    let full = format!("{val}{suffix}");
+                    let p = PathBuf::from(full);
+                    push(if p.is_absolute() { p } else { base_cwd.join(p) });
+                }
+            } else if after == "~" {
+                if let Ok(home) = env::var("HOME") { push(PathBuf::from(home)); }
+            } else if let Some(rest) = after.strip_prefix("~/") {
+                if let Ok(home) = env::var("HOME") { push(PathBuf::from(format!("{home}/{rest}"))); }
+            }
+        }
+    }
+    out
+}
+
+/// Pick the candidate CWD that resolves the most relative paths.
+/// Ties go to the first candidate (which is always the tracked/logged CWD).
+fn best_candidate(candidates: &[PathBuf], rel_paths: &[String]) -> PathBuf {
+    assert!(!candidates.is_empty());
+    candidates.iter()
+        .enumerate()
+        .max_by_key(|(i, cwd)| {
+            let count = rel_paths.iter().filter(|p| exists_at(p, cwd)).count();
+            (count, usize::MAX - i) // higher index = lower priority on tie
+        })
+        .map(|(_, c)| c.clone())
+        .unwrap_or_else(|| candidates[0].clone())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -837,6 +927,245 @@ mod tests {
         let result = parse_cd("cd \"/tmp\"", &PathBuf::from("/"));
         assert_eq!(result, Some(PathBuf::from("/tmp")));
     }
+
+    // --- resolve_env_token ---
+
+    #[test]
+    fn resolve_env_token_dollar_var() {
+        let home = env::var("HOME").unwrap_or_default();
+        if !home.is_empty() {
+            assert_eq!(resolve_env_token("$HOME"), Some(home));
+        }
+    }
+
+    #[test]
+    fn resolve_env_token_braces() {
+        let home = env::var("HOME").unwrap_or_default();
+        if !home.is_empty() {
+            assert_eq!(resolve_env_token("${HOME}"), Some(home));
+        }
+    }
+
+    #[test]
+    fn resolve_env_token_unknown_returns_none() {
+        assert_eq!(resolve_env_token("$HARVEST_TOTALLY_UNKNOWN_VAR_XYZ123"), None);
+    }
+
+    #[test]
+    fn resolve_env_token_no_dollar_returns_none() {
+        assert_eq!(resolve_env_token("HOME"), None);
+    }
+
+    #[test]
+    fn resolve_env_token_bare_dollar_returns_none() {
+        assert_eq!(resolve_env_token("$"), None);
+    }
+
+    // --- extract_dir_candidates ---
+
+    #[test]
+    fn dir_candidates_absolute_dir() {
+        let c = extract_dir_candidates("find /tmp -name '*.rs'", Path::new("/"));
+        assert!(c.contains(&PathBuf::from("/tmp")), "got: {c:?}");
+    }
+
+    #[test]
+    fn dir_candidates_absolute_file_excluded() {
+        // /etc/hosts is a file, not a directory
+        let c = extract_dir_candidates("/etc/hosts", Path::new("/"));
+        assert!(!c.contains(&PathBuf::from("/etc/hosts")), "got: {c:?}");
+    }
+
+    #[test]
+    fn dir_candidates_dotdot() {
+        // From /tmp, `..` normalises to /
+        let c = extract_dir_candidates("cd ..", Path::new("/tmp"));
+        assert!(c.iter().any(|p| p == Path::new("/")), "got: {c:?}");
+    }
+
+    #[test]
+    fn dir_candidates_dot_is_base() {
+        // `.` resolves to base_cwd itself
+        let c = extract_dir_candidates("find .", Path::new("/tmp"));
+        assert!(c.contains(&PathBuf::from("/tmp")), "got: {c:?}");
+    }
+
+    #[test]
+    fn dir_candidates_subshell_pattern() {
+        // tokenize strips parens; "cd" and ".." become separate tokens
+        let c = extract_dir_candidates("cd .. && find . | grep main", Path::new("/tmp"));
+        assert!(c.iter().any(|p| p == Path::new("/")), "got: {c:?}");
+    }
+
+    #[test]
+    fn dir_candidates_env_home() {
+        let home = env::var("HOME").unwrap_or_default();
+        if !home.is_empty() && Path::new(&home).is_dir() {
+            let c = extract_dir_candidates("cd $HOME", Path::new("/tmp"));
+            assert!(c.contains(&PathBuf::from(&home)), "HOME={home}, got: {c:?}");
+        }
+    }
+
+    #[test]
+    fn dir_candidates_env_braces() {
+        let home = env::var("HOME").unwrap_or_default();
+        if !home.is_empty() && Path::new(&home).is_dir() {
+            let c = extract_dir_candidates("cd ${HOME}", Path::new("/tmp"));
+            assert!(c.contains(&PathBuf::from(&home)));
+        }
+    }
+
+    #[test]
+    fn dir_candidates_tilde() {
+        let home = env::var("HOME").unwrap_or_default();
+        if !home.is_empty() && Path::new(&home).is_dir() {
+            let c = extract_dir_candidates("cd ~", Path::new("/tmp"));
+            assert!(c.contains(&PathBuf::from(&home)), "got: {c:?}");
+        }
+    }
+
+    #[test]
+    fn dir_candidates_tilde_subdir() {
+        let home = env::var("HOME").unwrap_or_default();
+        let target = format!("{home}/proj");
+        if Path::new(&target).is_dir() {
+            let c = extract_dir_candidates("cd ~/proj", Path::new("/tmp"));
+            assert!(c.contains(&PathBuf::from(&target)), "got: {c:?}");
+        }
+    }
+
+    #[test]
+    fn dir_candidates_inline_assignment_abs() {
+        let c = extract_dir_candidates("MYDIR=/tmp vim file.txt", Path::new("/"));
+        assert!(c.contains(&PathBuf::from("/tmp")), "got: {c:?}");
+    }
+
+    #[test]
+    fn dir_candidates_inline_assignment_env() {
+        let home = env::var("HOME").unwrap_or_default();
+        if !home.is_empty() && Path::new(&home).is_dir() {
+            let c = extract_dir_candidates("MYDIR=$HOME vim file.txt", Path::new("/"));
+            assert!(c.contains(&PathBuf::from(&home)), "got: {c:?}");
+        }
+    }
+
+    #[test]
+    fn dir_candidates_dedup() {
+        let c = extract_dir_candidates("/tmp /tmp", Path::new("/"));
+        assert_eq!(c.iter().filter(|p| *p == Path::new("/tmp")).count(), 1);
+    }
+
+    #[test]
+    fn dir_candidates_no_paths_returns_empty() {
+        let c = extract_dir_candidates("echo hello world", Path::new("/tmp"));
+        assert!(c.is_empty(), "got: {c:?}");
+    }
+
+    #[test]
+    fn dir_candidates_env_var_with_subpath() {
+        // $HOME/.. resolves to the parent of HOME — split at /, resolve $HOME, join with /..
+        let home = env::var("HOME").unwrap_or_default();
+        if !home.is_empty() {
+            if let Some(parent) = PathBuf::from(&home).parent() {
+                if parent.is_dir() {
+                    let c = extract_dir_candidates("cd $HOME/..", Path::new("/tmp"));
+                    assert!(c.contains(&parent.to_path_buf()), "parent={parent:?}, got: {c:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dir_candidates_env_var_with_subdir() {
+        // $HOME/proj — var resolved, then subpath appended
+        let home = env::var("HOME").unwrap_or_default();
+        if !home.is_empty() {
+            let target = PathBuf::from(format!("{home}/proj"));
+            if target.is_dir() {
+                let c = extract_dir_candidates("cd $HOME/proj", Path::new("/tmp"));
+                assert!(c.contains(&target), "got: {c:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn dir_candidates_inline_assignment_env_with_subpath() {
+        // MYDIR=$HOME/proj vim → resolve $HOME then join /proj
+        let home = env::var("HOME").unwrap_or_default();
+        if !home.is_empty() {
+            let target = PathBuf::from(format!("{home}/proj"));
+            if target.is_dir() {
+                let c = extract_dir_candidates("MYDIR=$HOME/proj vim file.txt", Path::new("/"));
+                assert!(c.contains(&target), "got: {c:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn dir_candidates_escaped_space_absolute() {
+        // "/Library/Application\ Support" is a real directory on macOS;
+        // tokenize turns `\ ` into a space, so the path is reconstructed correctly.
+        if Path::new("/Library/Application Support").is_dir() {
+            let c = extract_dir_candidates(
+                r"cd /Library/Application\ Support",
+                Path::new("/"),
+            );
+            assert!(
+                c.contains(&PathBuf::from("/Library/Application Support")),
+                "got: {c:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn dir_candidates_escaped_space_relative() {
+        // From /Library, `../Library/Application\ Support` → /Library/Application Support
+        if Path::new("/Library/Application Support").is_dir() {
+            let c = extract_dir_candidates(
+                r"find ../Library/Application\ Support -name '*.plist'",
+                Path::new("/tmp"),
+            );
+            assert!(
+                c.contains(&PathBuf::from("/Library/Application Support")),
+                "got: {c:?}",
+            );
+        }
+    }
+
+    // --- best_candidate ---
+
+    #[test]
+    fn best_candidate_picks_most_matches() {
+        // from /, ./tmp and ./etc both exist; from /tmp, ./tmp = /tmp/tmp (unlikely), ./etc = /tmp/etc (no)
+        let candidates = vec![PathBuf::from("/"), PathBuf::from("/tmp")];
+        let rel_paths = vec!["./tmp".to_string(), "./etc".to_string()];
+        let best = best_candidate(&candidates, &rel_paths);
+        assert_eq!(best, PathBuf::from("/"), "/ should win with more matches");
+    }
+
+    #[test]
+    fn best_candidate_tie_goes_to_first() {
+        let candidates = vec![PathBuf::from("/tmp"), PathBuf::from("/")];
+        let best = best_candidate(&candidates, &[]);
+        assert_eq!(best, PathBuf::from("/tmp"), "first candidate wins on tie");
+    }
+
+    #[test]
+    fn best_candidate_single() {
+        let candidates = vec![PathBuf::from("/tmp")];
+        let best = best_candidate(&candidates, &["./nonexistent_xyz_abc".to_string()]);
+        assert_eq!(best, PathBuf::from("/tmp"));
+    }
+
+    #[test]
+    fn best_candidate_second_wins() {
+        // / has ./tmp and ./etc; /tmp has neither of these relative paths
+        // Swap: second candidate is / and it should win
+        let candidates = vec![PathBuf::from("/nonexistent_xyz"), PathBuf::from("/")];
+        let rel_paths = vec!["./tmp".to_string(), "./etc".to_string()];
+        let best = best_candidate(&candidates, &rel_paths);
+        assert_eq!(best, PathBuf::from("/"));
+    }
 }
 
 struct Args {
@@ -908,7 +1237,10 @@ fn main() {
     dbg!("use_prompt: {use_prompt}, literals: {prompt_literals:?}");
 
     // Build per-section CWD map for last 20 commands (when prompt available).
-    let mut section_cwds: Vec<(usize, PathBuf)> = Vec::new();
+    // Each section holds a Vec of candidate CWDs; candidates[0] is always the
+    // tracked CWD (cwd_log match or undo_cd fallback); the rest come from paths
+    // parsed out of the command string.  The best candidate is resolved later.
+    let mut section_cwds: Vec<(usize, Vec<PathBuf>)> = Vec::new();
 
     if use_prompt {
         let prompt_indices: Vec<usize> = lines.iter().enumerate()
@@ -950,6 +1282,7 @@ fn main() {
         for (prompt_idx, undo_cwd) in undo_baseline {
             let prompt_line = &lines[prompt_idx];
             let mut matched_cwd = None;
+            let mut matched_cmd: Option<String> = None;
             if let Some(ref entries) = log_entries {
                 let mut scan = log_ptr;
                 while scan > 0 {
@@ -959,21 +1292,53 @@ fn main() {
                         let before = prompt_line.len() - cmd.len();
                         if before == 0 || prompt_line.as_bytes()[before - 1] == b' ' {
                             matched_cwd = Some(cwd.clone());
+                            matched_cmd = Some(cmd.clone());
                             log_ptr = scan;
                             break;
                         }
                     }
                 }
             }
-            let cwd = matched_cwd.unwrap_or(undo_cwd);
-            dbg!("  prompt[{prompt_idx}] {:?} → {cwd:?}", prompt_line);
-            section_cwds.push((prompt_idx, cwd));
+            let tracked_cwd = matched_cwd.unwrap_or(undo_cwd);
+
+            // Derive the command string: cwd_log match is authoritative; fall back to
+            // parsing the raw prompt line (less precise but always available).
+            let cmd_str: &str = matched_cmd.as_deref().unwrap_or_else(||
+                extract_command_from_prompt_line(prompt_line, &prompt_literals));
+
+            // Build candidate list: tracked CWD first, then dirs found in the command.
+            let mut candidates = vec![tracked_cwd.clone()];
+            for dir in extract_dir_candidates(cmd_str, &tracked_cwd) {
+                if !candidates.contains(&dir) {
+                    candidates.push(dir);
+                }
+            }
+
+            dbg!("  prompt[{prompt_idx}] {:?} → tracked={tracked_cwd:?}, {} extra candidates",
+                 prompt_line, candidates.len() - 1);
+            section_cwds.push((prompt_idx, candidates));
         }
     }
 
-    // For a given line index, find the best CWD to use
+    // Resolve each section to a single best CWD by counting how many relative
+    // paths in that section's line range exist at each candidate.
+    let resolved_cwds: Vec<(usize, PathBuf)> = section_cwds.iter().enumerate()
+        .map(|(k, (start_idx, candidates))| {
+            // section k spans [start_idx, end_idx); k=0 is the most-recent section.
+            let end_idx = if k == 0 { lines.len() } else { section_cwds[k - 1].0 };
+            let rel_paths: Vec<String> = lines[*start_idx..end_idx].iter()
+                .flat_map(|l| extract_relative(l).into_iter().chain(extract_dotwords(l)))
+                .collect();
+            let best = best_candidate(candidates, &rel_paths);
+            dbg!("  section[{start_idx}..{end_idx}] best_cwd={best:?} \
+                  ({} candidates, {} rel paths)", candidates.len(), rel_paths.len());
+            (*start_idx, best)
+        })
+        .collect();
+
+    // For a given line index, find the best CWD to use.
     let cwd_for_line = |line_idx: usize| -> &Path {
-        for (section_start, section_cwd) in &section_cwds {
+        for (section_start, section_cwd) in &resolved_cwds {
             if line_idx >= *section_start {
                 return section_cwd.as_path();
             }
@@ -989,17 +1354,17 @@ fn main() {
         let abs_candidates: Vec<String> = extract_absolute(line).into_iter()
             .chain(extract_absolute_greedy(line))
             .collect();
-        for candidate in abs_candidates {
+        for candidate in abs_candidates.into_iter().rev() {
             let exists = Path::new(&candidate).exists();
             dbg!("  abs [{i}] {candidate:?} → exists={exists}");
             if !seen.contains(&candidate) && exists {
-                for v in path_variants(&candidate) {
+                for v in path_variants(&candidate).into_iter().rev() {
                     if seen.insert(v.clone()) { println!("{}", v); }
                 }
             }
         }
 
-        for candidate in extract_relative(line) {
+        for candidate in extract_relative(line).into_iter().rev() {
             dbg!("  rel [{i}] {candidate:?} in {cwd:?} → exists={}", exists_at(&candidate, cwd));
             if !exists_at(&candidate, cwd) { continue; }
             let output = rebase_path(&candidate, cwd, &args.cwd);
@@ -1007,7 +1372,7 @@ fn main() {
         }
 
         if use_prompt {
-            for candidate in extract_dotwords(line) {
+            for candidate in extract_dotwords(line).into_iter().rev() {
                 if !exists_at(&candidate, cwd) { continue; }
                 let output = rebase_path(&candidate, cwd, &args.cwd);
                 if seen.insert(output.clone()) { println!("{}", output); }
