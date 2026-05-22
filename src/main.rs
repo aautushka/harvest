@@ -375,6 +375,16 @@ fn undo_cd(target: &str, result_cwd: &Path) -> Option<PathBuf> {
     }
 }
 
+// Extract the directory basename rendered in a prompt line (the %c slot).
+// Prompt lines look like: "➜  dirname [git info] [cmd]"
+fn prompt_line_dirname(line: &str) -> Option<&str> {
+    let i = line.find("➜")?;
+    let rest = line[i + "➜".len()..].trim_start_matches(' ');
+    let end = rest.find(|c: char| c == ' ' || c == '/').unwrap_or(rest.len());
+    let name = &rest[..end];
+    if name.is_empty() { None } else { Some(name) }
+}
+
 // ── CWD candidate extraction ──────────────────────────────────────────────────
 
 fn resolve_env_token(token: &str) -> Option<String> {
@@ -448,16 +458,26 @@ fn extract_dir_candidates(cmd: &str, base_cwd: &Path, fs: &dyn Filesystem) -> Ve
 
 /// Pick the candidate CWD that resolves the most relative paths.
 /// Ties go to the first candidate (always the tracked/logged CWD).
+// Pick the candidate CWD that resolves the most relative paths.
+// Assumes exactly one real CWD per command — we vote on it but can't determine
+// more than one (e.g. "cd A && cmd; cd B && cmd2" in a single command string).
+// Early exit when a candidate resolves every path (perfect score).
 fn best_candidate(candidates: &[PathBuf], rel_paths: &[String], fs: &dyn Filesystem) -> PathBuf {
     assert!(!candidates.is_empty());
-    candidates.iter()
-        .enumerate()
-        .max_by_key(|(i, cwd)| {
-            let count = rel_paths.iter().filter(|p| exists_at(p, cwd, fs)).count();
-            (count, usize::MAX - i)
-        })
-        .map(|(_, c)| c.clone())
-        .unwrap_or_else(|| candidates[0].clone())
+    let perfect = rel_paths.len();
+    let mut best_cwd = &candidates[0];
+    let mut best_score = 0usize;
+    for cwd in candidates {
+        let score = rel_paths.iter().filter(|p| exists_at(p, cwd, fs)).count();
+        if score == perfect {
+            return cwd.clone();
+        }
+        if score > best_score {
+            best_score = score;
+            best_cwd = cwd;
+        }
+    }
+    best_cwd.clone()
 }
 
 // ── Core pipeline ─────────────────────────────────────────────────────────────
@@ -515,7 +535,15 @@ fn run_harvest(
             for &i in prompt_indices.iter().rev().take(20) {
                 let prev = if let Some(target) = find_cd_in_line(&lines[i]) {
                     dbg!("  undo_cd prompt[{i}]: cd {target:?} from {cur:?}");
-                    undo_cd(target, &cur).unwrap_or_else(|| cur.clone())
+                    undo_cd(target, &cur)
+                        .or_else(|| {
+                            // Can't reverse algebraically (e.g. cd .., cd /abs).
+                            // Try the dirname shown in the prompt as the pre-cd location.
+                            prompt_line_dirname(&lines[i])
+                                .map(|name| cur.join(name))
+                                .filter(|p| fs.is_dir(p))
+                        })
+                        .unwrap_or_else(|| cur.clone())
                 } else {
                     cur.clone()
                 };
@@ -1177,6 +1205,27 @@ mod tests {
         );
     }
 
+    #[test]
+    fn best_candidate_early_exit_on_perfect_match() {
+        // Perfect candidate is first; a later candidate also matches but should
+        // never be reached. The decoy at index 1 would win a tie-break (higher
+        // score) if iteration continued past the perfect match at index 0.
+        let fs = MemFs::new(&[
+            "/proj/a/foo.rs",
+            "/proj/a/bar.rs",
+            "/proj/b/foo.rs",
+        ]);
+        let candidates = vec![
+            PathBuf::from("/proj/a"), // perfect: resolves all 2 rel_paths
+            PathBuf::from("/proj/b"), // partial: resolves only foo.rs
+        ];
+        let rel_paths = vec!["./foo.rs".to_string(), "./bar.rs".to_string()];
+        assert_eq!(
+            best_candidate(&candidates, &rel_paths, &fs),
+            PathBuf::from("/proj/a"),
+        );
+    }
+
     // --- MemFs ---
 
     #[test]
@@ -1209,164 +1258,10 @@ mod tests {
     }
 }
 
-// ── Integration tests ─────────────────────────────────────────────────────────
+// ── Scenario tests ───────────────────────────────────────────────────────────
 
 #[cfg(test)]
-mod integration {
-    use super::*;
-
-    // The typical oh-my-zsh prompt format
-    const PROMPT: &str = r"%(?:%{%}%1{➜%} :%{%}%1{➜%} ) %{%}%c%{%} $(git_prompt_info)";
-
-    struct Scenario {
-        fs: MemFs,
-    }
-
-    impl Scenario {
-        fn new(files: &[&str]) -> Self {
-            Self { fs: MemFs::new(files) }
-        }
-
-        fn run(
-            &self,
-            scrollback: &[&str],
-            cwd: &str,
-            prompt: Option<&str>,
-            cwd_log: &[(&str, &str)],
-        ) -> Vec<String> {
-            let lines = scrollback.iter().map(|s| s.to_string()).collect();
-            let log = cwd_log.iter()
-                .map(|(c, cmd)| (PathBuf::from(*c), cmd.to_string()))
-                .collect();
-            run_harvest(lines, PathBuf::from(cwd), prompt.map(str::to_string), log, &self.fs, false)
-        }
-    }
-
-    // Build a prompt line matching the typical zsh theme (no git info)
-    fn pl(dir: &str) -> String {
-        format!("➜  {dir} ")
-    }
-
-    // Build a prompt line with git branch
-    fn plg(dir: &str, branch: &str) -> String {
-        format!("➜  {dir} git:({branch}) ✗ ")
-    }
-
-    #[test]
-    fn basic_relative_paths_no_cd() {
-        let s = Scenario::new(&[
-            "/proj/yankrich/src/ansi.rs",
-            "/proj/yankrich/src/main.rs",
-        ]);
-        let result = s.run(
-            &[
-                &plg("yankrich", "main"),
-                "./src/ansi.rs",
-                "./src/main.rs",
-                &format!("{}find . | grep rs$", plg("yankrich", "main")),
-            ],
-            "/proj/yankrich",
-            Some(PROMPT),
-            &[("/proj/yankrich", "find . | grep rs$")],
-        );
-        assert!(result.iter().any(|p| p == "./src/ansi.rs"), "got: {result:?}");
-        assert!(result.iter().any(|p| p == "./src/main.rs"), "got: {result:?}");
-    }
-
-    #[test]
-    fn relative_paths_rebased_after_cd() {
-        // Reproduces the reported bug: find output in yankrich/ seen from proj/ after cd ..
-        let s = Scenario::new(&[
-            "/proj/yankrich/src/ansi.rs",
-            "/proj/yankrich/src/main.rs",
-            "/proj/yankrich/src/blocks.rs",
-            "/proj/yankrich/src/rtf.rs",
-        ]);
-        let result = s.run(
-            &[
-                &format!("{}find . | grep rs$", plg("yankrich", "main")),
-                "./src/ansi.rs",
-                "./src/main.rs",
-                "./src/blocks.rs",
-                "./src/rtf.rs",
-                &format!("{}cd ..", plg("yankrich", "main")),
-                &pl("proj"),
-            ],
-            "/proj",
-            Some(PROMPT),
-            &[
-                ("/proj/yankrich", "find . | grep rs$"),
-                ("/proj", "cd .."),
-            ],
-        );
-        assert!(
-            result.iter().any(|p| p == "./yankrich/src/ansi.rs"),
-            "expected ./yankrich/src/ansi.rs, got: {result:?}"
-        );
-        assert!(
-            result.iter().any(|p| p == "./yankrich/src/main.rs"),
-            "got: {result:?}"
-        );
-    }
-
-    #[test]
-    fn absolute_paths_extracted() {
-        let s = Scenario::new(&["/proj/harvest/src/main.rs"]);
-        let result = s.run(
-            &["error at /proj/harvest/src/main.rs:42"],
-            "/proj",
-            None,
-            &[],
-        );
-        assert!(
-            result.contains(&"/proj/harvest/src/main.rs".to_string()),
-            "got: {result:?}"
-        );
-    }
-
-    #[test]
-    fn subshell_cd_resolved_via_candidates() {
-        // (cd .. && find . | grep rs$) run from /proj/yankrich
-        // preexec records CWD=/proj/yankrich but paths are relative to /proj
-        let s = Scenario::new(&[
-            "/proj/src/lib.rs",
-            "/proj/src/main.rs",
-        ]);
-        let result = s.run(
-            &[
-                &format!("{}(cd .. && find . | grep rs$)", plg("yankrich", "main")),
-                "./src/lib.rs",
-                "./src/main.rs",
-                &pl("proj"),
-            ],
-            "/proj",
-            Some(PROMPT),
-            &[
-                ("/proj/yankrich", "(cd .. && find . | grep rs$)"),
-                ("/proj", ""),
-            ],
-        );
-        // Candidates: [/proj/yankrich (tracked), /proj (from `..`), /proj/yankrich (from `.`)]
-        // /proj wins since both paths resolve there
-        assert!(
-            result.iter().any(|p| p == "./src/lib.rs" || p == "/proj/src/lib.rs"),
-            "got: {result:?}"
-        );
-    }
-
-    #[test]
-    fn no_prompt_no_relative_dotwords() {
-        // Without prompt tracking, dotwords should not appear
-        let s = Scenario::new(&["/proj/src/main.rs"]);
-        let result = s.run(
-            &["edit main.rs and done"],
-            "/proj/src",
-            None, // no prompt
-            &[],
-        );
-        assert!(!result.contains(&"main.rs".to_string()), "got: {result:?}");
-    }
-}
+mod scenarios;
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
 
