@@ -1,7 +1,9 @@
 // Scenario tests: full pipeline with a mocked filesystem.
 // Each test declares the files that exist, feeds in a scrollback + cwd_log,
 // and asserts on the output of run_harvest.
-use super::*;
+use std::path::PathBuf;
+use crate::fs::MemFs;
+use super::run_harvest;
 
 const PROMPT: &str = r"%(?:%{%}%1{➜%} :%{%}%1{➜%} ) %{%}%c%{%} $(git_prompt_info)";
 
